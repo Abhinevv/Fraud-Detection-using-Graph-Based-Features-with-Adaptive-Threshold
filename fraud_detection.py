@@ -52,6 +52,57 @@ def has_labels(df: pd.DataFrame) -> bool:
     return "fraud_label" in df.columns and df["fraud_label"].notna().any()
 
 
+def is_paysim_format(df: pd.DataFrame) -> bool:
+    """Detect whether a dataframe looks like raw PaySim data."""
+    paysim_columns = {
+        "step",
+        "type",
+        "amount",
+        "nameOrig",
+        "oldbalanceOrg",
+        "newbalanceOrig",
+        "nameDest",
+        "oldbalanceDest",
+        "newbalanceDest",
+    }
+    return paysim_columns.issubset(set(df.columns))
+
+
+def normalize_paysim_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert raw PaySim columns into the canonical project schema."""
+    normalized = df.copy()
+    normalized["sender_id"] = normalized["nameOrig"]
+    normalized["receiver_id"] = normalized["nameDest"]
+    normalized["timestamp"] = pd.to_numeric(normalized["step"], errors="coerce") * 3600
+    normalized["fraud_label"] = (
+        pd.to_numeric(normalized["isFraud"], errors="coerce")
+        if "isFraud" in normalized.columns
+        else np.nan
+    )
+    normalized["transaction_type"] = normalized["type"].astype(str)
+    normalized["origin_balance_delta"] = (
+        pd.to_numeric(normalized["oldbalanceOrg"], errors="coerce")
+        - pd.to_numeric(normalized["newbalanceOrig"], errors="coerce")
+    )
+    normalized["dest_balance_delta"] = (
+        pd.to_numeric(normalized["newbalanceDest"], errors="coerce")
+        - pd.to_numeric(normalized["oldbalanceDest"], errors="coerce")
+    )
+    normalized["origin_zero_after"] = (
+        pd.to_numeric(normalized["newbalanceOrig"], errors="coerce").fillna(0) == 0
+    ).astype(int)
+    normalized["dest_zero_before"] = (
+        pd.to_numeric(normalized["oldbalanceDest"], errors="coerce").fillna(0) == 0
+    ).astype(int)
+    normalized["merchant_id"] = np.where(
+        normalized["nameDest"].astype(str).str.startswith("M"),
+        normalized["nameDest"].astype(str),
+        "",
+    )
+    normalized["payment_channel"] = normalized["type"].astype(str)
+    return normalized
+
+
 @dataclass
 class TrainingArtifacts:
     model: RandomForestClassifier
@@ -60,6 +111,21 @@ class TrainingArtifacts:
     y_train: pd.Series
     y_test: pd.Series
     y_proba: np.ndarray
+
+
+@dataclass
+class GNNArtifacts:
+    weights_1: np.ndarray
+    weights_2: np.ndarray
+    feature_mean: np.ndarray
+    feature_std: np.ndarray
+    train_indices: np.ndarray
+    test_indices: np.ndarray
+    node_order: list[str]
+    y_true_test: np.ndarray
+    y_proba_test: np.ndarray
+    y_proba_all: np.ndarray
+    training_history: list[dict[str, float]]
 
 
 def _to_datetime_series(values: pd.Series) -> pd.Series:
@@ -175,6 +241,9 @@ def load_data(
     """Load a CSV file if provided, otherwise generate synthetic data."""
     if filepath:
         df = pd.read_csv(filepath)
+        if is_paysim_format(df):
+            safe_print("[DATA] Detected PaySim format. Applying automatic column mapping.")
+            df = normalize_paysim_dataframe(df)
         required = REQUIRED_COLUMNS if require_labels else BASE_COLUMNS
         missing = required - set(df.columns)
         if missing:
@@ -190,6 +259,23 @@ def load_data(
     df = df.copy()
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    if "origin_balance_delta" in df.columns:
+        df["origin_balance_delta"] = pd.to_numeric(df["origin_balance_delta"], errors="coerce")
+    if "dest_balance_delta" in df.columns:
+        df["dest_balance_delta"] = pd.to_numeric(df["dest_balance_delta"], errors="coerce")
+    if "sender_account_age_days" in df.columns:
+        df["sender_account_age_days"] = pd.to_numeric(df["sender_account_age_days"], errors="coerce")
+    if "receiver_account_age_days" in df.columns:
+        df["receiver_account_age_days"] = pd.to_numeric(df["receiver_account_age_days"], errors="coerce")
+    for optional_text_col in [
+        "transaction_type",
+        "merchant_id",
+        "payment_channel",
+        "device_id",
+        "location",
+    ]:
+        if optional_text_col in df.columns:
+            df[optional_text_col] = df[optional_text_col].fillna("").astype(str)
     if "fraud_label" in df.columns:
         df["fraud_label"] = pd.to_numeric(df["fraud_label"], errors="coerce")
     elif require_labels:
@@ -207,12 +293,33 @@ def build_graph(df: pd.DataFrame) -> nx.MultiDiGraph:
     graph = nx.MultiDiGraph()
     for row in df.itertuples(index=False):
         fraud_value = int(row.fraud_label) if hasattr(row, "fraud_label") and pd.notna(row.fraud_label) else 0
+        origin_balance_delta = getattr(row, "origin_balance_delta", 0.0)
+        dest_balance_delta = getattr(row, "dest_balance_delta", 0.0)
         graph.add_edge(
             row.sender_id,
             row.receiver_id,
             amount=float(row.amount),
             timestamp=float(row.timestamp),
             fraud=fraud_value,
+            transaction_type=getattr(row, "transaction_type", ""),
+            merchant_id=getattr(row, "merchant_id", ""),
+            payment_channel=getattr(row, "payment_channel", ""),
+            device_id=getattr(row, "device_id", ""),
+            location=getattr(row, "location", ""),
+            origin_balance_delta=float(origin_balance_delta) if pd.notna(origin_balance_delta) else 0.0,
+            dest_balance_delta=float(dest_balance_delta) if pd.notna(dest_balance_delta) else 0.0,
+            origin_zero_after=int(getattr(row, "origin_zero_after", 0) or 0),
+            dest_zero_before=int(getattr(row, "dest_zero_before", 0) or 0),
+            sender_account_age_days=(
+                float(getattr(row, "sender_account_age_days", 0.0))
+                if pd.notna(getattr(row, "sender_account_age_days", np.nan))
+                else 0.0
+            ),
+            receiver_account_age_days=(
+                float(getattr(row, "receiver_account_age_days", 0.0))
+                if pd.notna(getattr(row, "receiver_account_age_days", np.nan))
+                else 0.0
+            ),
         )
 
     safe_print(
@@ -326,6 +433,17 @@ def _extract_features_internal(
         sent_amounts = [edge_data["amount"] for _, _, edge_data in outgoing]
         received_amounts = [edge_data["amount"] for _, _, edge_data in incoming]
         all_amounts = sent_amounts + received_amounts
+        outgoing_types = [edge_data.get("transaction_type", "") for _, _, edge_data in outgoing]
+        outgoing_merchants = [edge_data.get("merchant_id", "") for _, _, edge_data in outgoing]
+        outgoing_channels = [edge_data.get("payment_channel", "") for _, _, edge_data in outgoing]
+        outgoing_devices = [edge_data.get("device_id", "") for _, _, edge_data in outgoing]
+        outgoing_locations = [edge_data.get("location", "") for _, _, edge_data in outgoing]
+        outgoing_origin_deltas = [edge_data.get("origin_balance_delta", np.nan) for _, _, edge_data in outgoing]
+        incoming_dest_deltas = [edge_data.get("dest_balance_delta", np.nan) for _, _, edge_data in incoming]
+        outgoing_zero_after = [edge_data.get("origin_zero_after", 0) for _, _, edge_data in outgoing]
+        incoming_zero_before = [edge_data.get("dest_zero_before", 0) for _, _, edge_data in incoming]
+        outgoing_sender_ages = [edge_data.get("sender_account_age_days", np.nan) for _, _, edge_data in outgoing]
+        incoming_receiver_ages = [edge_data.get("receiver_account_age_days", np.nan) for _, _, edge_data in incoming]
 
         sent_times = sorted(edge_data["timestamp"] for _, _, edge_data in outgoing)
         if len(sent_times) > 1:
@@ -333,11 +451,68 @@ def _extract_features_internal(
             transaction_frequency = len(sent_times) / span_hours
         else:
             transaction_frequency = float(len(sent_times))
+        sent_hours = [pd.to_datetime(ts, unit="s", errors="coerce").hour for ts in sent_times]
 
         neighbors = set(graph.predecessors(node)).union(set(graph.successors(node)))
         neighbor_fraud_ratio = (
             sum(node_risk_flags.get(neighbor, 0) for neighbor in neighbors) / len(neighbors)
             if neighbors
+            else 0.0
+        )
+
+        transfer_ratio = (
+            sum(tx_type == "TRANSFER" for tx_type in outgoing_types) / len(outgoing_types)
+            if outgoing_types
+            else 0.0
+        )
+        cashout_ratio = (
+            sum(tx_type == "CASH_OUT" for tx_type in outgoing_types) / len(outgoing_types)
+            if outgoing_types
+            else 0.0
+        )
+        payment_ratio = (
+            sum(tx_type == "PAYMENT" for tx_type in outgoing_types) / len(outgoing_types)
+            if outgoing_types
+            else 0.0
+        )
+        avg_origin_balance_delta = (
+            float(np.nanmean(outgoing_origin_deltas))
+            if len(outgoing_origin_deltas) and not np.isnan(outgoing_origin_deltas).all()
+            else 0.0
+        )
+        avg_dest_balance_delta = (
+            float(np.nanmean(incoming_dest_deltas))
+            if len(incoming_dest_deltas) and not np.isnan(incoming_dest_deltas).all()
+            else 0.0
+        )
+        zero_balance_origin_ratio = (
+            float(np.mean(outgoing_zero_after)) if outgoing_zero_after else 0.0
+        )
+        zero_balance_dest_ratio = (
+            float(np.mean(incoming_zero_before)) if incoming_zero_before else 0.0
+        )
+        merchant_diversity = len({merchant for merchant in outgoing_merchants if merchant})
+        channel_diversity = len({channel for channel in outgoing_channels if channel})
+        device_diversity = len({device for device in outgoing_devices if device})
+        geo_diversity = len({location for location in outgoing_locations if location})
+        merchant_usage_ratio = (
+            sum(bool(merchant) for merchant in outgoing_merchants) / len(outgoing_merchants)
+            if outgoing_merchants
+            else 0.0
+        )
+        off_hours_ratio = (
+            sum(hour in {0, 1, 2, 3, 4, 5} for hour in sent_hours) / len(sent_hours)
+            if sent_hours
+            else 0.0
+        )
+        avg_sender_account_age_days = (
+            float(np.nanmean(outgoing_sender_ages))
+            if len(outgoing_sender_ages) and not np.isnan(outgoing_sender_ages).all()
+            else 0.0
+        )
+        avg_receiver_account_age_days = (
+            float(np.nanmean(incoming_receiver_ages))
+            if len(incoming_receiver_ages) and not np.isnan(incoming_receiver_ages).all()
             else 0.0
         )
 
@@ -357,6 +532,21 @@ def _extract_features_internal(
                 "out_degree": int(graph.out_degree(node)),
                 "neighbor_fraud_ratio": float(neighbor_fraud_ratio),
                 "transaction_frequency": float(transaction_frequency),
+                "transfer_ratio": float(transfer_ratio),
+                "cashout_ratio": float(cashout_ratio),
+                "payment_ratio": float(payment_ratio),
+                "avg_origin_balance_delta": float(avg_origin_balance_delta),
+                "avg_dest_balance_delta": float(avg_dest_balance_delta),
+                "zero_balance_origin_ratio": float(zero_balance_origin_ratio),
+                "zero_balance_dest_ratio": float(zero_balance_dest_ratio),
+                "merchant_diversity": float(merchant_diversity),
+                "channel_diversity": float(channel_diversity),
+                "device_diversity": float(device_diversity),
+                "geo_diversity": float(geo_diversity),
+                "merchant_usage_ratio": float(merchant_usage_ratio),
+                "off_hours_ratio": float(off_hours_ratio),
+                "avg_sender_account_age_days": float(avg_sender_account_age_days),
+                "avg_receiver_account_age_days": float(avg_receiver_account_age_days),
                 "fraud_label": int(node_risk_flags.get(node, 0)),
             }
         )
@@ -519,6 +709,177 @@ def get_user_profile(
     return summary
 
 
+def _build_normalized_adjacency(graph: nx.MultiDiGraph, node_order: list[str]) -> np.ndarray:
+    """Create the symmetrically normalized adjacency matrix with self-loops."""
+    node_index = {node: idx for idx, node in enumerate(node_order)}
+    adjacency = np.zeros((len(node_order), len(node_order)), dtype=float)
+    for sender, receiver in graph.edges():
+        sender_idx = node_index[sender]
+        receiver_idx = node_index[receiver]
+        adjacency[sender_idx, receiver_idx] += 1.0
+        adjacency[receiver_idx, sender_idx] += 1.0
+
+    adjacency += np.eye(len(node_order))
+    degree = adjacency.sum(axis=1)
+    inv_sqrt_degree = np.diag(1.0 / np.sqrt(np.clip(degree, 1e-9, None)))
+    return inv_sqrt_degree @ adjacency @ inv_sqrt_degree
+
+
+def _relu(values: np.ndarray) -> np.ndarray:
+    return np.maximum(values, 0.0)
+
+
+def _relu_grad(values: np.ndarray) -> np.ndarray:
+    return (values > 0).astype(float)
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values, -30, 30)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
+def train_gnn_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    graph: nx.MultiDiGraph,
+    test_size: float = 0.2,
+    seed: int = 42,
+    hidden_dim: int = 24,
+    epochs: int = 400,
+    learning_rate: float = 0.03,
+) -> GNNArtifacts:
+    """
+    Train a lightweight 2-layer GCN for node classification using NumPy.
+
+    This keeps the project dependency-light while still implementing real
+    graph neural network message passing.
+    """
+    node_order = X.index.tolist()
+    adjacency_hat = _build_normalized_adjacency(graph, node_order)
+
+    X_array = X.to_numpy(dtype=float)
+    y_array = y.loc[node_order].to_numpy(dtype=float).reshape(-1, 1)
+
+    all_indices = np.arange(len(node_order))
+    train_indices, test_indices = train_test_split(
+        all_indices,
+        test_size=test_size,
+        random_state=seed,
+        stratify=y_array.ravel(),
+    )
+
+    feature_mean = X_array[train_indices].mean(axis=0, keepdims=True)
+    feature_std = X_array[train_indices].std(axis=0, keepdims=True)
+    feature_std = np.where(feature_std < 1e-8, 1.0, feature_std)
+    X_norm = (X_array - feature_mean) / feature_std
+
+    rng = np.random.default_rng(seed)
+    weights_1 = rng.normal(0, 0.1, size=(X_norm.shape[1], hidden_dim))
+    weights_2 = rng.normal(0, 0.1, size=(hidden_dim, 1))
+    train_labels_flat = y_array[train_indices].ravel()
+    positive_count = max(float(train_labels_flat.sum()), 1.0)
+    negative_count = max(float(len(train_labels_flat) - train_labels_flat.sum()), 1.0)
+    positive_weight = negative_count / positive_count
+
+    training_history: list[dict[str, float]] = []
+
+    for epoch in range(1, epochs + 1):
+        support_1 = adjacency_hat @ X_norm
+        z1 = support_1 @ weights_1
+        h1 = _relu(z1)
+        support_2 = adjacency_hat @ h1
+        logits = support_2 @ weights_2
+        probabilities = _sigmoid(logits)
+
+        train_probs = probabilities[train_indices]
+        train_labels = y_array[train_indices]
+        sample_weights = np.where(train_labels == 1, positive_weight, 1.0)
+        loss = -np.mean(
+            sample_weights
+            * (
+                train_labels * np.log(np.clip(train_probs, 1e-9, 1.0))
+                + (1 - train_labels) * np.log(np.clip(1 - train_probs, 1e-9, 1.0))
+            )
+        )
+
+        d_logits = np.zeros_like(probabilities)
+        d_logits[train_indices] = ((train_probs - train_labels) * sample_weights) / len(train_indices)
+
+        d_weights_2 = support_2.T @ d_logits
+        d_support_2 = d_logits @ weights_2.T
+        d_h1 = adjacency_hat.T @ d_support_2
+        d_z1 = d_h1 * _relu_grad(z1)
+        d_weights_1 = support_1.T @ d_z1
+
+        weights_1 -= learning_rate * d_weights_1
+        weights_2 -= learning_rate * d_weights_2
+
+        if epoch == 1 or epoch % 25 == 0 or epoch == epochs:
+            preds = (train_probs >= 0.5).astype(int)
+            train_acc = accuracy_score(train_labels.astype(int), preds.astype(int))
+            training_history.append(
+                {
+                    "epoch": float(epoch),
+                    "loss": float(loss),
+                    "train_accuracy": float(train_acc),
+                }
+            )
+
+    final_support_1 = adjacency_hat @ X_norm
+    final_z1 = final_support_1 @ weights_1
+    final_h1 = _relu(final_z1)
+    final_support_2 = adjacency_hat @ final_h1
+    final_logits = final_support_2 @ weights_2
+    final_probabilities = _sigmoid(final_logits).ravel()
+
+    safe_print(
+        f"[GNN] Trained GCN on {len(train_indices)} nodes | Test set: {len(test_indices)} nodes"
+    )
+    return GNNArtifacts(
+        weights_1=weights_1,
+        weights_2=weights_2,
+        feature_mean=feature_mean,
+        feature_std=feature_std,
+        train_indices=train_indices,
+        test_indices=test_indices,
+        node_order=node_order,
+        y_true_test=y_array[test_indices].ravel(),
+        y_proba_test=final_probabilities[test_indices],
+        y_proba_all=final_probabilities,
+        training_history=training_history,
+    )
+
+
+def score_all_users_gnn(
+    gnn_artifacts: GNNArtifacts,
+    X: pd.DataFrame,
+    graph: nx.MultiDiGraph,
+    threshold: float,
+) -> pd.DataFrame:
+    """Score all users in a graph using the trained NumPy GCN."""
+    node_order = X.index.tolist()
+    adjacency_hat = _build_normalized_adjacency(graph, node_order)
+    X_array = X.to_numpy(dtype=float)
+    X_norm = (X_array - gnn_artifacts.feature_mean) / gnn_artifacts.feature_std
+
+    support_1 = adjacency_hat @ X_norm
+    z1 = support_1 @ gnn_artifacts.weights_1
+    h1 = _relu(z1)
+    support_2 = adjacency_hat @ h1
+    logits = support_2 @ gnn_artifacts.weights_2
+    probabilities = _sigmoid(logits).ravel()
+
+    scored = X.copy()
+    scored["fraud_probability"] = probabilities
+    scored["predicted_label"] = (probabilities >= threshold).astype(int)
+    scored["risk_level"] = pd.cut(
+        probabilities,
+        bins=[-0.01, 0.35, 0.7, 1.0],
+        labels=["Low", "Medium", "High"],
+    ).astype(str)
+    return scored.sort_values("fraud_probability", ascending=False)
+
+
 def run_prediction_pipeline(
     model: RandomForestClassifier,
     filepath: str,
@@ -529,6 +890,26 @@ def run_prediction_pipeline(
     prediction_graph = build_graph(prediction_df)
     prediction_X = extract_features_for_inference(prediction_df, prediction_graph)
     scored_users = score_all_users(model, prediction_X, threshold)
+    case_table = build_case_table(prediction_df, scored_users)
+    return {
+        "df": prediction_df,
+        "graph": prediction_graph,
+        "X": prediction_X,
+        "scored_users": scored_users,
+        "case_table": case_table,
+    }
+
+
+def run_prediction_pipeline_with_gnn(
+    gnn_artifacts: GNNArtifacts,
+    filepath: str,
+    threshold: float,
+) -> dict[str, Any]:
+    """Score a new unlabeled transaction CSV using the trained GNN."""
+    prediction_df = load_data(filepath=filepath, require_labels=False)
+    prediction_graph = build_graph(prediction_df)
+    prediction_X = extract_features_for_inference(prediction_df, prediction_graph)
+    scored_users = score_all_users_gnn(gnn_artifacts, prediction_X, prediction_graph, threshold)
     case_table = build_case_table(prediction_df, scored_users)
     return {
         "df": prediction_df,
@@ -872,6 +1253,7 @@ def run_pipeline(
     graph = build_graph(df)
     X, y = extract_features(df, graph)
     artifacts = train_model(X, y, test_size=test_size)
+    gnn_artifacts = train_gnn_model(X, y, graph, test_size=test_size)
 
     baseline = evaluate_model(
         artifacts.y_test,
@@ -891,8 +1273,30 @@ def run_pipeline(
         threshold=best_threshold,
         label="Adaptive Threshold Evaluation",
     )
+
+    gnn_baseline = evaluate_model(
+        gnn_artifacts.y_true_test,
+        gnn_artifacts.y_proba_test,
+        threshold=0.5,
+        label="GNN Baseline Evaluation",
+    )
+    gnn_best_threshold, gnn_rl_history = adaptive_threshold(
+        gnn_artifacts.y_true_test,
+        gnn_artifacts.y_proba_test,
+        init_threshold=init_threshold,
+        n_iterations=n_iterations,
+    )
+    gnn_adaptive = evaluate_model(
+        gnn_artifacts.y_true_test,
+        gnn_artifacts.y_proba_test,
+        threshold=gnn_best_threshold,
+        label="GNN Adaptive Threshold Evaluation",
+    )
+
     scored_users = score_all_users(artifacts.model, X, best_threshold)
     case_table = build_case_table(df, scored_users)
+    gnn_scored_users = score_all_users_gnn(gnn_artifacts, X, graph, gnn_best_threshold)
+    gnn_case_table = build_case_table(df, gnn_scored_users)
 
     visualization_path = visualize_results(
         baseline,
@@ -920,8 +1324,15 @@ def run_pipeline(
         "adaptive": adaptive,
         "best_threshold": best_threshold,
         "rl_history": rl_history,
+        "gnn_artifacts": gnn_artifacts,
+        "gnn_baseline": gnn_baseline,
+        "gnn_adaptive": gnn_adaptive,
+        "gnn_best_threshold": gnn_best_threshold,
+        "gnn_rl_history": gnn_rl_history,
         "scored_users": scored_users,
         "case_table": case_table,
+        "gnn_scored_users": gnn_scored_users,
+        "gnn_case_table": gnn_case_table,
         "visualization_path": visualization_path,
     }
 

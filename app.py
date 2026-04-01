@@ -14,6 +14,7 @@ from fraud_detection import (
     get_user_profile,
     run_pipeline,
     run_prediction_pipeline,
+    run_prediction_pipeline_with_gnn,
 )
 
 
@@ -33,6 +34,8 @@ if "prediction_bytes" not in st.session_state:
     st.session_state.prediction_bytes = None
 if "prediction_results" not in st.session_state:
     st.session_state.prediction_results = None
+if "gnn_prediction_results" not in st.session_state:
+    st.session_state.gnn_prediction_results = None
 
 st.title("Fraud Investigation Intelligence Dashboard")
 st.caption("Graph-based detection, adaptive thresholding, and user-level investigation workflows")
@@ -102,12 +105,19 @@ if run_button or not st.session_state.analysis_ready:
                 prediction_path,
                 st.session_state.results["best_threshold"],
             )
+            st.session_state.gnn_prediction_results = run_prediction_pipeline_with_gnn(
+                st.session_state.results["gnn_artifacts"],
+                prediction_path,
+                st.session_state.results["gnn_best_threshold"],
+            )
         else:
             st.session_state.prediction_results = None
+            st.session_state.gnn_prediction_results = None
         st.session_state.analysis_ready = True
 
 results = st.session_state.results
 prediction_results = st.session_state.prediction_results
+gnn_prediction_results = st.session_state.gnn_prediction_results
 
 df = results["df"]
 graph = results["graph"]
@@ -115,8 +125,12 @@ X = results["X"]
 baseline = results["baseline"]
 adaptive = results["adaptive"]
 history_df = pd.DataFrame(results["rl_history"])
+gnn_baseline = results["gnn_baseline"]
+gnn_adaptive = results["gnn_adaptive"]
+gnn_history_df = pd.DataFrame(results["gnn_rl_history"])
 case_table = results["case_table"].copy()
 scored_users = results["scored_users"].copy()
+gnn_case_table = results["gnn_case_table"].copy()
 
 
 def with_user_id_column(frame: pd.DataFrame) -> pd.DataFrame:
@@ -138,8 +152,8 @@ col4.metric("High-Risk Users", f"{int((case_table['risk_level'] == 'High').sum()
 summary1, summary2, summary3, summary4 = st.columns(4)
 summary1.metric("Baseline F1", f"{baseline['f1']:.3f}")
 summary2.metric("Adaptive F1", f"{adaptive['f1']:.3f}", delta=f"{adaptive['f1'] - baseline['f1']:+.3f}")
-summary3.metric("Final Threshold", f"{results['best_threshold']:.2f}")
-summary4.metric("Graph Density", f"{nx.density(nx.DiGraph(graph)):0.4f}")
+summary3.metric("RF Threshold", f"{results['best_threshold']:.2f}")
+summary4.metric("GNN F1", f"{gnn_adaptive['f1']:.3f}", delta=f"{gnn_adaptive['f1'] - gnn_baseline['f1']:+.3f}")
 
 overview_tab, training_cases_tab, prediction_tab, user_tab, analytics_tab = st.tabs(
     ["Overview", "Training Queue", "Prediction Queue", "User Search", "Analytics"]
@@ -165,11 +179,30 @@ with overview_tab:
                     },
                     {
                         "model_view": "Adaptive",
+                        "model_type": "RandomForest",
                         "threshold": results["best_threshold"],
                         "accuracy": adaptive["accuracy"],
                         "precision": adaptive["precision"],
                         "recall": adaptive["recall"],
                         "f1": adaptive["f1"],
+                    },
+                    {
+                        "model_view": "Baseline",
+                        "model_type": "GNN",
+                        "threshold": 0.50,
+                        "accuracy": gnn_baseline["accuracy"],
+                        "precision": gnn_baseline["precision"],
+                        "recall": gnn_baseline["recall"],
+                        "f1": gnn_baseline["f1"],
+                    },
+                    {
+                        "model_view": "Adaptive",
+                        "model_type": "GNN",
+                        "threshold": results["gnn_best_threshold"],
+                        "accuracy": gnn_adaptive["accuracy"],
+                        "precision": gnn_adaptive["precision"],
+                        "recall": gnn_adaptive["recall"],
+                        "f1": gnn_adaptive["f1"],
                     },
                 ]
             ),
@@ -185,6 +218,7 @@ with overview_tab:
 
 with training_cases_tab:
     st.subheader("Priority Investigation Queue")
+    st.markdown("**RandomForest queue**")
     display_cases = with_user_id_column(case_table)
     queue_columns = [
         "user_id",
@@ -202,6 +236,11 @@ with training_cases_tab:
         use_container_width=True,
     )
     st.markdown("This queue ranks users by model probability, suspicious neighbors, velocity, and repeated fraud involvement.")
+    st.markdown("**GNN queue**")
+    st.dataframe(
+        with_user_id_column(gnn_case_table)[queue_columns].head(25),
+        use_container_width=True,
+    )
 
 with prediction_tab:
     st.subheader("Prediction on New Unlabeled Transactions")
@@ -209,12 +248,14 @@ with prediction_tab:
         st.info("Upload a prediction CSV without `fraud_label` to score new users after training.")
     else:
         prediction_case_table = prediction_results["case_table"]
+        gnn_prediction_case_table = gnn_prediction_results["case_table"] if gnn_prediction_results is not None else None
         prediction_display = with_user_id_column(prediction_case_table)
         px1, px2, px3, px4 = st.columns(4)
         px1.metric("Prediction Transactions", f"{len(prediction_results['df']):,}")
         px2.metric("Prediction Users", f"{prediction_results['graph'].number_of_nodes():,}")
         px3.metric("High-Risk Predicted Users", f"{int((prediction_case_table['risk_level'] == 'High').sum()):,}")
         px4.metric("Threshold Used", f"{results['best_threshold']:.2f}")
+        st.markdown("**RandomForest prediction queue**")
         st.dataframe(
             prediction_display[
                 [
@@ -230,6 +271,23 @@ with prediction_tab:
             ].head(25),
             use_container_width=True,
         )
+        if gnn_prediction_case_table is not None:
+            st.markdown("**GNN prediction queue**")
+            st.dataframe(
+                with_user_id_column(gnn_prediction_case_table)[
+                    [
+                        "user_id",
+                        "risk_level",
+                        "fraud_probability",
+                        "investigation_priority",
+                        "recent_activity",
+                        "neighbor_fraud_ratio",
+                        "transaction_frequency",
+                        "max_transaction_amount",
+                    ]
+                ].head(25),
+                use_container_width=True,
+            )
         st.markdown(
             "These are predictions on new transactions with no ground-truth fraud labels. "
             "The model was trained on historical labeled data and is now scoring fresh users."
@@ -238,12 +296,15 @@ with prediction_tab:
 with user_tab:
     st.subheader("Search and Investigate a User")
     data_source = st.radio("Investigation source", ["Training data", "Prediction data"], horizontal=True)
+    model_source = st.radio("Model source", ["RandomForest", "GNN"], horizontal=True)
     selected_table = case_table
     selected_df = df
     selected_graph = graph
     prediction_available = prediction_results is not None
+    if model_source == "GNN":
+        selected_table = gnn_case_table
     if data_source == "Prediction data" and prediction_results is not None:
-        selected_table = prediction_results["case_table"]
+        selected_table = prediction_results["case_table"] if model_source == "RandomForest" else gnn_prediction_results["case_table"]
         selected_df = prediction_results["df"]
         selected_graph = prediction_results["graph"]
     if data_source == "Prediction data" and not prediction_available:
@@ -342,18 +403,27 @@ with analytics_tab:
     st.subheader("System Analytics")
     a1, a2 = st.columns(2)
     with a1:
-        st.markdown("**Adaptive threshold iterations**")
+        st.markdown("**RandomForest adaptive threshold iterations**")
         st.dataframe(history_df, use_container_width=True)
     with a2:
-        st.markdown("**Top high-risk users**")
+        st.markdown("**Top high-risk users (RandomForest)**")
         st.dataframe(
             with_user_id_column(scored_users)
             [["user_id", "fraud_probability", "risk_level", "neighbor_fraud_ratio", "transaction_frequency"]]
             .head(15),
             use_container_width=True,
         )
+    st.markdown("**GNN adaptive threshold iterations**")
+    st.dataframe(gnn_history_df, use_container_width=True)
+    st.markdown("**Top high-risk users (GNN)**")
+    st.dataframe(
+        with_user_id_column(results["gnn_scored_users"])
+        [["user_id", "fraud_probability", "risk_level", "neighbor_fraud_ratio", "transaction_frequency"]]
+        .head(15),
+        use_container_width=True,
+    )
 
     st.markdown("**Feature Matrix Preview**")
     st.dataframe(X.head(20), use_container_width=True)
 
-st.success("Investigation system is ready. You can now search a user and inspect their full history.")
+st.success("Investigation system is ready. You can now compare RandomForest and GNN risk scoring and inspect user history.")
